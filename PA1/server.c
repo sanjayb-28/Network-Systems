@@ -10,10 +10,11 @@
 
 #define BUFFER_SIZE 8192
 
-void *handle_connection(void *socket_ptr);
-const char *get_content_type(const char *path);
+// Function Prototypes
+void *handle_client(void *client_socket_ptr);
+const char *get_mime_type(const char *file_path);
 
-// Main function: Sets up server and handles connections
+// Main function: sets up the socket and enters the main accept loop.
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "USAGE: %s <port>\n", argv[0]);
@@ -21,169 +22,161 @@ int main(int argc, char *argv[]) {
     }
 
     int port = atoi(argv[1]);
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr, "Invalid port number.\n");
+    if (port <= 0) {
+        fprintf(stderr, "ERROR: Invalid port number.\n");
         return 1;
     }
 
-    int server_fd;
+    int server_sock;
     struct sockaddr_in server_addr;
 
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        perror("ERROR: Could not create socket");
         exit(EXIT_FAILURE);
     }
 
-    // Avoid "Address already in use" errors
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind failed");
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("ERROR: Bind failed");
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 10) < 0) {
-        perror("listen");
+    if (listen(server_sock, 10) < 0) {
+        perror("ERROR: Listen failed");
         exit(EXIT_FAILURE);
     }
 
-    printf("Server listening on port %d...\n", port);
+    printf("Server is running on port %d\n", port);
 
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
-        int *client_socket_ptr = malloc(sizeof(int));
+        int *client_sock = malloc(sizeof(int));
+        *client_sock = accept(server_sock, NULL, NULL);
 
-        if ((*client_socket_ptr = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len)) < 0) {
-            perror("accept");
-            free(client_socket_ptr);
+        if (*client_sock < 0) {
+            perror("WARN: Accept failed");
+            free(client_sock);
             continue;
         }
         
         pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, handle_connection, (void *)client_socket_ptr) != 0) {
-            perror("pthread_create failed");
-            close(*client_socket_ptr);
-            free(client_socket_ptr);
+        if (pthread_create(&thread_id, NULL, handle_client, (void *)client_sock) != 0) {
+            perror("WARN: Could not create thread");
+            close(*client_sock);
+            free(client_sock);
         }
         pthread_detach(thread_id);
     }
 
-    close(server_fd);
+    close(server_sock);
     return 0;
 }
 
-void *handle_connection(void *socket_ptr) {
-    int client_socket = *(int*)socket_ptr;
-    free(socket_ptr);
+// Thread function: handles all communication with a single client.
+void *handle_client(void *client_socket_ptr) {
+    int client_sock = *(int*)client_socket_ptr;
+    free(client_socket_ptr);
 
-    // 10-second timeout
-    struct timeval tv = {10, 0};
-    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     char buffer[BUFFER_SIZE];
-    int keep_alive = 0;
-
-    do {
+    
+    while (1) {
         memset(buffer, 0, BUFFER_SIZE);
-        ssize_t bytes_received = read(client_socket, buffer, BUFFER_SIZE - 1);
-        if (bytes_received <= 0) {
+        
+        ssize_t bytes_read = read(client_sock, buffer, BUFFER_SIZE - 1);
+        if (bytes_read <= 0) {
             break;
         }
 
         char method[16], uri[256], version[16];
         sscanf(buffer, "%s %s %s", method, uri, version);
 
-        // HTTP/1.1 defaults to keep-alive
-        keep_alive = (strcmp(version, "HTTP/1.1") == 0);
+        int keep_alive;
+        if (strcmp(version, "HTTP/1.1") == 0) {
+            keep_alive = 1;
+        } else {
+            keep_alive = 0;
+        }
         if (strstr(buffer, "Connection: close")) {
             keep_alive = 0;
         }
 
-        // Only handle GET requests
+        int is_valid_request = 1;
         if (strcmp(method, "GET") != 0) {
-            char response[] = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
-            write(client_socket, response, strlen(response));
-            continue;
-        }
-        
-        // Only support HTTP/1.0 and HTTP/1.1
-        if (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0) {
-            char response[] = "HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 0\r\n\r\n";
-            write(client_socket, response, strlen(response));
-            continue;
+            char response[] = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+            write(client_sock, response, strlen(response));
+            is_valid_request = 0;
+        } else if (strcmp(version, "HTTP/1.1") != 0 && strcmp(version, "HTTP/1.0") != 0) {
+            char response[] = "HTTP/1.1 505 HTTP Version Not Supported\r\n\r\n";
+            write(client_sock, response, strlen(response));
+            is_valid_request = 0;
         }
 
-        // Default to index.html for root path
-        char filepath[512];
-        if (strcmp(uri, "/") == 0) {
-            strcpy(uri, "/index.html");
-        }
-        sprintf(filepath, "www%s", uri);
-        
-        struct stat file_stat;
-        if (stat(filepath, &file_stat) < 0) {
-            // File not found
-            char body[] = "<html><body><h1>404 Not Found</h1></body></html>";
-            char header[256];
-            sprintf(header, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", 
-                    strlen(body));
-            write(client_socket, header, strlen(header));
-            write(client_socket, body, strlen(body));
-            keep_alive = 0;
-        } else {
+        if (is_valid_request) {
+            char filepath[512];
+            if (strcmp(uri, "/") == 0) {
+                strcpy(filepath, "www/index.html");
+            } else {
+                sprintf(filepath, "www%s", uri);
+            }
+            
             FILE *file = fopen(filepath, "rb");
             if (file == NULL) {
-                // Permission denied or other error
-                char body[] = "<html><body><h1>403 Forbidden</h1></body></html>";
-                char header[256];
-                sprintf(header, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", 
-                        strlen(body));
-                write(client_socket, header, strlen(header));
-                write(client_socket, body, strlen(body));
+                char response[] = "HTTP/1.1 404 Not Found\r\n"
+                                  "Content-Type: text/html\r\n"
+                                  "\r\n"
+                                  "<h1>404 Not Found</h1>";
+                write(client_sock, response, strlen(response));
                 keep_alive = 0;
             } else {
-                // Found the file, send it
+                struct stat file_stat;
+                stat(filepath, &file_stat);
                 long file_size = file_stat.st_size;
-                const char *content_type = get_content_type(filepath);
+
+                const char *mime_type = get_mime_type(filepath);
 
                 char header[512];
                 sprintf(header, "HTTP/1.1 200 OK\r\n"
-                               "Content-Type: %s\r\n"
-                               "Content-Length: %ld\r\n"
-                               "Connection: %s\r\n\r\n",
-                               content_type, file_size, 
-                               keep_alive ? "keep-alive" : "close");
+                                "Content-Type: %s\r\n"
+                                "Content-Length: %ld\r\n"
+                                "Connection: %s\r\n\r\n",
+                                mime_type, file_size, 
+                                keep_alive ? "keep-alive" : "close");
                 
-                write(client_socket, header, strlen(header));
+                write(client_sock, header, strlen(header));
 
                 char file_buffer[BUFFER_SIZE];
-                size_t bytes_read;
-                while ((bytes_read = fread(file_buffer, 1, BUFFER_SIZE, file)) > 0) {
-                    write(client_socket, file_buffer, bytes_read);
+                size_t chunk_size;
+                while ((chunk_size = fread(file_buffer, 1, BUFFER_SIZE, file)) > 0) {
+                    write(client_sock, file_buffer, chunk_size);
                 }
                 fclose(file);
             }
         }
-    } while (keep_alive);
 
-    close(client_socket);
+        if (!keep_alive) {
+            break;
+        }
+    }
+
+    close(client_sock);
     return NULL;
 }
 
-// Get MIME type based on file extension
-const char *get_content_type(const char *path) {
-    const char *dot = strrchr(path, '.');
-    if (!dot || dot == path) 
-        return "application/octet-stream";
+// Helper function: returns the MIME type for a given file path.
+const char *get_mime_type(const char *file_path) {
+    const char *dot = strrchr(file_path, '.');
+    if (!dot) return "application/octet-stream";
 
     if (strcmp(dot, ".html") == 0) return "text/html";
     if (strcmp(dot, ".css") == 0) return "text/css";
