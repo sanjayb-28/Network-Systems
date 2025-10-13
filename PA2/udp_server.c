@@ -10,10 +10,9 @@
 #include <sys/select.h>
 #include <errno.h>
 
-// --- GBN Protocol Definition ---
 #define PAYLOAD_SIZE 1024
-#define WINDOW_SIZE 5
-#define TIMEOUT_MS 500
+#define WINDOW_SIZE 512
+#define TIMEOUT_MS 5
 
 typedef enum {
     LS, DELETE, GET, PUT, EXIT,
@@ -26,14 +25,12 @@ typedef struct {
     size_t payload_len;
     char payload[PAYLOAD_SIZE];
 } packet;
-// --- End of GBN Protocol Definition ---
 
 void die(char *s) {
     perror(s);
     exit(1);
 }
 
-// Handler for the 'ls' command
 void handle_ls(int sockfd, struct sockaddr_in client_addr, socklen_t slen) {
     DIR *d;
     struct dirent *dir;
@@ -59,7 +56,6 @@ void handle_ls(int sockfd, struct sockaddr_in client_addr, socklen_t slen) {
     sendto(sockfd, &res_pkt, sizeof(res_pkt), 0, (struct sockaddr *)&client_addr, slen);
 }
 
-// Handler for the 'delete' command
 void handle_delete(int sockfd, const char* filename, struct sockaddr_in client_addr, socklen_t slen) {
     packet res_pkt;
     if (remove(filename) == 0) {
@@ -75,8 +71,6 @@ void handle_delete(int sockfd, const char* filename, struct sockaddr_in client_a
     sendto(sockfd, &res_pkt, sizeof(res_pkt), 0, (struct sockaddr *)&client_addr, slen);
 }
 
-
-// Reliably SEND a file ('get') using Go-Back-N
 void handle_get(int sockfd, const char* filename, struct sockaddr_in client_addr, socklen_t slen) {
     FILE *file = fopen(filename, "rb");
     if (!file) {
@@ -99,23 +93,21 @@ void handle_get(int sockfd, const char* filename, struct sockaddr_in client_addr
     struct timeval timeout;
 
     while (!file_done || base < next_seq_num) {
-        // Phase 1: Send packets until the window is full
         while (next_seq_num < base + WINDOW_SIZE && !file_done) {
             int win_idx = next_seq_num % WINDOW_SIZE;
             size_t bytes_read = fread(window[win_idx].payload, 1, PAYLOAD_SIZE, file);
-
-            window[win_idx].type = DATA;
-            window[win_idx].sequence_number = next_seq_num;
-            window[win_idx].payload_len = bytes_read;
             
-            if (bytes_read < PAYLOAD_SIZE) {
-                file_done = 1; // This was the last chunk of the file
+            if (bytes_read > 0) {
+                window[win_idx].type = DATA;
+                window[win_idx].sequence_number = next_seq_num;
+                window[win_idx].payload_len = bytes_read;
+                sendto(sockfd, &window[win_idx], sizeof(packet), 0, (struct sockaddr *)&client_addr, slen);
+                next_seq_num++;
+            } else {
+                file_done = 1;
             }
-            sendto(sockfd, &window[win_idx], sizeof(packet), 0, (struct sockaddr *)&client_addr, slen);
-            next_seq_num++;
         }
 
-        // Phase 2: Wait for an ACK or timeout
         FD_ZERO(&readfds);
         FD_SET(sockfd, &readfds);
         timeout.tv_sec = 0;
@@ -123,22 +115,25 @@ void handle_get(int sockfd, const char* filename, struct sockaddr_in client_addr
 
         int ready_sockets = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
         
-        if (ready_sockets == 0) { // Timeout
-            printf("Timeout on base %d, resending window.\n", base);
+        if (ready_sockets == 0) {
             for (int i = base; i < next_seq_num; i++) {
                 sendto(sockfd, &window[i % WINDOW_SIZE], sizeof(packet), 0, (struct sockaddr *)&client_addr, slen);
             }
-        } else { // ACK received
+        } else {
             packet ack_pkt;
-            recvfrom(sockfd, &ack_pkt, sizeof(ack_pkt), 0, NULL, NULL);
-            if (ack_pkt.type == ACK && ack_pkt.sequence_number >= base - 1) {
-                // Move window base forward
-                base = ack_pkt.sequence_number + 1;
+            while (1) {
+                ssize_t received = recvfrom(sockfd, &ack_pkt, sizeof(ack_pkt), MSG_DONTWAIT, NULL, NULL);
+                if (received < 0) break;
+                
+                if (ack_pkt.type == ACK && 
+                    ack_pkt.sequence_number < next_seq_num &&
+                    ack_pkt.sequence_number + 1 > base) {
+                    base = ack_pkt.sequence_number + 1;
+                }
             }
         }
     }
     
-    // Reliably send the final EOF packet (0-length payload)
     packet eof_pkt;
     eof_pkt.type = DATA;
     eof_pkt.sequence_number = next_seq_num;
@@ -157,10 +152,8 @@ void handle_get(int sockfd, const char* filename, struct sockaddr_in client_addr
             packet final_ack;
             recvfrom(sockfd, &final_ack, sizeof(final_ack), 0, NULL, NULL);
             if (final_ack.type == ACK && final_ack.sequence_number == next_seq_num) {
-                break; // Final ACK received, we are done
+                break;
             }
-        } else {
-            printf("Timeout on EOF packet, resending.\n");
         }
     }
 
@@ -168,13 +161,10 @@ void handle_get(int sockfd, const char* filename, struct sockaddr_in client_addr
     printf("File transfer complete for '%s'.\n", filename);
 }
 
-
-// Reliably RECEIVE a file ('put') using Go-Back-N
 void handle_put(int sockfd, const char* filename, struct sockaddr_in client_addr, socklen_t slen) {
     FILE *file = fopen(filename, "wb");
     if (!file) {
         perror("fopen");
-        // Still need to ACK the put request to unblock the client, even on error
         packet err_ack;
         err_ack.type = ACK;
         err_ack.sequence_number = -1;
@@ -183,10 +173,9 @@ void handle_put(int sockfd, const char* filename, struct sockaddr_in client_addr
     }
     printf("Receiving file '%s' with Go-Back-N...\n", filename);
     
-    // Send ACK for the initial PUT request to start the transfer
     packet ack_pkt;
     ack_pkt.type = ACK;
-    ack_pkt.sequence_number = -1; // Special ACK for the command, not data
+    ack_pkt.sequence_number = -1;
     sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr*)&client_addr, slen);
     
     packet data_pkt;
@@ -195,27 +184,25 @@ void handle_put(int sockfd, const char* filename, struct sockaddr_in client_addr
         recvfrom(sockfd, &data_pkt, sizeof(data_pkt), 0, (struct sockaddr *)&client_addr, &slen);
         
         if (data_pkt.type == DATA && data_pkt.sequence_number == expected_seq_num) {
-            // Correct packet received
             if (data_pkt.payload_len == 0) {
-                 ack_pkt.sequence_number = expected_seq_num; // ACK the EOF packet
+                 ack_pkt.sequence_number = expected_seq_num;
                  sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr*)&client_addr, slen);
-                 break; // Transfer is complete
+                 break;
             }
             fwrite(data_pkt.payload, 1, data_pkt.payload_len, file);
             ack_pkt.sequence_number = expected_seq_num;
             sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr*)&client_addr, slen);
             expected_seq_num++;
         } else {
-            // Wrong packet received, discard it and re-send the ACK for the last good packet
-            printf("Discarding packet #%d, expecting #%d. Resending ACK #%d.\n", data_pkt.sequence_number, expected_seq_num, expected_seq_num - 1);
-            ack_pkt.sequence_number = expected_seq_num - 1;
-            sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr*)&client_addr, slen);
+            if (expected_seq_num > 0) {
+                ack_pkt.sequence_number = expected_seq_num - 1;
+                sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr*)&client_addr, slen);
+            }
         }
     }
     fclose(file);
     printf("File reception complete for '%s'.\n", filename);
 }
-
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
@@ -231,6 +218,11 @@ int main(int argc, char *argv[]) {
 
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) die("socket() failed");
 
+    int sndbuf = 8192 * 1024;
+    int rcvbuf = 8192 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
@@ -242,8 +234,7 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         recvfrom(sockfd, &recv_pkt, sizeof(recv_pkt), 0, (struct sockaddr *)&client_addr, &slen);
-        printf("Received command '%d' from %s:%d\n", recv_pkt.type, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
+        
         switch (recv_pkt.type) {
             case LS:
                 handle_ls(sockfd, client_addr, slen);

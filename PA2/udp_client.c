@@ -9,10 +9,9 @@
 #include <sys/select.h>
 #include <errno.h>
 
-// --- GBN Protocol Definition ---
 #define PAYLOAD_SIZE 1024
-#define WINDOW_SIZE 5
-#define TIMEOUT_MS 500
+#define WINDOW_SIZE 512
+#define TIMEOUT_MS 5
 
 typedef enum {
     LS, DELETE, GET, PUT, EXIT,
@@ -25,14 +24,12 @@ typedef struct {
     size_t payload_len;
     char payload[PAYLOAD_SIZE];
 } packet;
-// --- End of GBN Protocol Definition ---
 
 void die(char *s) {
     perror(s);
     exit(1);
 }
 
-// Reliably RECEIVE a file ('get') using Go-Back-N
 void handle_get_client(int sockfd, const char* filename, struct sockaddr_in server_addr) {
     FILE *file = fopen(filename, "wb");
     if (!file) {
@@ -51,13 +48,12 @@ void handle_get_client(int sockfd, const char* filename, struct sockaddr_in serv
     while(1) {
         recvfrom(sockfd, &data_pkt, sizeof(data_pkt), 0, (struct sockaddr *)&server_addr, &slen);
         
-        // GBN Rule: Only accept packets that are in order.
         if (data_pkt.type == DATA && data_pkt.sequence_number == expected_seq_num) {
             if (data_pkt.payload_len == 0) {
                 printf("\nTransfer complete.\n");
                 ack_pkt.sequence_number = expected_seq_num;
                 sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&server_addr, slen);
-                break; // EOF packet marks the end
+                break;
             }
             fwrite(data_pkt.payload, 1, data_pkt.payload_len, file);
             printf(".");
@@ -70,17 +66,16 @@ void handle_get_client(int sockfd, const char* filename, struct sockaddr_in serv
             printf("\nError from server: %s\n", data_pkt.payload);
             break;
         } else {
-            // Discard out-of-order packet, but re-send the ACK for the last good packet
-            printf("\nDiscarding packet #%d, expecting #%d. Resending ACK #%d.\n", data_pkt.sequence_number, expected_seq_num, expected_seq_num - 1);
-            ack_pkt.sequence_number = expected_seq_num - 1;
-            sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&server_addr, slen);
+            if (expected_seq_num > 0) {
+                ack_pkt.sequence_number = expected_seq_num - 1;
+                sendto(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&server_addr, slen);
+            }
         }
     }
     fclose(file);
-    if (data_pkt.type == ERROR) remove(filename); // Clean up partial file on error
+    if (data_pkt.type == ERROR) remove(filename);
 }
 
-// Reliably SEND a file ('put') using Go-Back-N
 void handle_put_client(int sockfd, const char* filename, struct sockaddr_in server_addr) {
     FILE *file = fopen(filename, "rb");
     if (!file) {
@@ -88,7 +83,6 @@ void handle_put_client(int sockfd, const char* filename, struct sockaddr_in serv
         return;
     }
 
-    // First, wait for the server to ACK our 'put' command
     packet ack_pkt;
     socklen_t slen = sizeof(server_addr);
     recvfrom(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&server_addr, &slen);
@@ -113,38 +107,42 @@ void handle_put_client(int sockfd, const char* filename, struct sockaddr_in serv
             int win_idx = next_seq_num % WINDOW_SIZE;
             size_t bytes_read = fread(window[win_idx].payload, 1, PAYLOAD_SIZE, file);
 
-            window[win_idx].type = DATA;
-            window[win_idx].sequence_number = next_seq_num;
-            window[win_idx].payload_len = bytes_read;
-            
-            if (bytes_read < PAYLOAD_SIZE) {
+            if (bytes_read > 0) {
+                window[win_idx].type = DATA;
+                window[win_idx].sequence_number = next_seq_num;
+                window[win_idx].payload_len = bytes_read;
+                sendto(sockfd, &window[win_idx], sizeof(packet), 0, (struct sockaddr *)&server_addr, slen);
+                next_seq_num++;
+            } else {
                 file_done = 1;
             }
-            sendto(sockfd, &window[win_idx], sizeof(packet), 0, (struct sockaddr *)&server_addr, slen);
-            next_seq_num++;
         }
 
         FD_ZERO(&readfds);
         FD_SET(sockfd, &readfds);
         timeout.tv_sec = 0;
         timeout.tv_usec = TIMEOUT_MS * 1000;
-
+        
         int ready_sockets = select(sockfd + 1, &readfds, NULL, NULL, &timeout);
         
-        if (ready_sockets == 0) { // Timeout
-            printf("Timeout on base %d, resending window.\n", base);
+        if (ready_sockets == 0) {
             for (int i = base; i < next_seq_num; i++) {
                 sendto(sockfd, &window[i % WINDOW_SIZE], sizeof(packet), 0, (struct sockaddr *)&server_addr, slen);
             }
-        } else { // ACK received
-            recvfrom(sockfd, &ack_pkt, sizeof(ack_pkt), 0, NULL, NULL);
-            if (ack_pkt.type == ACK && ack_pkt.sequence_number >= base - 1) {
-                base = ack_pkt.sequence_number + 1;
+        } else {
+            while (1) {
+                ssize_t received = recvfrom(sockfd, &ack_pkt, sizeof(ack_pkt), MSG_DONTWAIT, NULL, NULL);
+                if (received < 0) break;
+                
+                if (ack_pkt.type == ACK && 
+                    ack_pkt.sequence_number < next_seq_num &&
+                    ack_pkt.sequence_number + 1 > base) {
+                    base = ack_pkt.sequence_number + 1;
+                }
             }
         }
     }
     
-    // Reliably send the final EOF packet
     packet eof_pkt;
     eof_pkt.type = DATA;
     eof_pkt.sequence_number = next_seq_num;
@@ -162,15 +160,12 @@ void handle_put_client(int sockfd, const char* filename, struct sockaddr_in serv
             if (final_ack.type == ACK && final_ack.sequence_number == next_seq_num) {
                 break;
             }
-        } else {
-             printf("Timeout on EOF packet, resending.\n");
         }
     }
 
     fclose(file);
     printf("File transfer complete for '%s'.\n", filename);
 }
-
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
@@ -185,6 +180,11 @@ int main(int argc, char *argv[]) {
     packet pkt, ack_pkt;
 
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) die("socket() failed");
+
+    int sndbuf = 8192 * 1024;
+    int rcvbuf = 8192 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -234,10 +234,9 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(command, "exit") == 0) {
             pkt.type = EXIT;
             sendto(sockfd, &pkt, sizeof(pkt), 0, (struct sockaddr *)&server_addr, slen);
-            // Wait for the server's final ACK before we actually exit
             recvfrom(sockfd, &ack_pkt, sizeof(ack_pkt), 0, (struct sockaddr *)&server_addr, &slen);
             printf("Server acknowledged exit. Shutting down.\n");
-            break; // Now we can break the loop
+            break;
         } else {
             printf("Unknown command: %s\n", command);
         }
