@@ -8,7 +8,6 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/select.h>
-#include <errno.h>
 
 #define PAYLOAD_SIZE 1024
 #define WINDOW_SIZE 512
@@ -217,11 +216,6 @@ int main(int argc, char *argv[]) {
     packet recv_pkt;
 
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) die("socket() failed");
-
-    int sndbuf = 8192 * 1024;
-    int rcvbuf = 8192 * 1024;
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
