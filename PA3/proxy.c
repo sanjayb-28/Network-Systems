@@ -24,8 +24,10 @@ int server_socket = -1;
 int cache_timeout = 0;
 char *blocklist[MAX_BLOCKLIST];
 int blocklist_count = 0;
+int prefetch_done = 0;
 pthread_mutex_t blocklist_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t prefetch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     int client_sock;
@@ -269,10 +271,23 @@ void *handle_client(void *arg) {
     memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
     
     if (connect(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        send_error(client_sock, 502, "Bad Gateway");
         close(server_sock);
+        
+        if (cache_path) {
+            struct stat st;
+            if (stat(cache_path, &st) == 0) {
+                if (read_from_cache(cache_path, client_sock)) {
+                    close(client_sock);
+                    free(cache_path);
+                    free(client);
+                    return NULL;
+                }
+            }
+            free(cache_path);
+        }
+        
+        send_error(client_sock, 502, "Bad Gateway");
         close(client_sock);
-        if (cache_path) free(cache_path);
         free(client);
         return NULL;
     }
@@ -299,7 +314,7 @@ void *handle_client(void *arg) {
         
         if (use_cache) {
             if (response_size + bytes_read > response_capacity) {
-                response_capacity = (response_capacity == 0) ? BUFFER_SIZE : response_capacity * 2;
+                response_capacity = (response_capacity == 0) ? BUFFER_SIZE : response_capacity + BUFFER_SIZE;
                 char *new_data = realloc(response_data, response_capacity);
                 if (!new_data) {
                     free(response_data);
@@ -316,7 +331,16 @@ void *handle_client(void *arg) {
     
     if (use_cache && response_data && response_size > 0) {
         write_to_cache(cache_path, response_data, response_size);
-        extract_links_and_prefetch(url, response_data, response_size);
+        
+        pthread_mutex_lock(&prefetch_mutex);
+        if (!prefetch_done) {
+            prefetch_done = 1;
+            pthread_mutex_unlock(&prefetch_mutex);
+            extract_links_and_prefetch(url, response_data, response_size);
+            sleep(30);
+        } else {
+            pthread_mutex_unlock(&prefetch_mutex);
+        }
     }
     
     if (response_data) free(response_data);
@@ -350,7 +374,9 @@ void *prefetch_url(void *arg) {
     }
     
     char *cache_path = get_cache_path(url);
-    if (check_cache_valid(cache_path)) {
+    
+    struct stat st;
+    if (stat(cache_path, &st) == 0) {
         free(cache_path);
         free(url);
         return NULL;
@@ -377,9 +403,10 @@ void *prefetch_url(void *arg) {
     memcpy(&server_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
     
     struct timeval timeout;
-    timeout.tv_sec = 5;
+    timeout.tv_sec = 20;
     timeout.tv_usec = 0;
     setsockopt(server_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(server_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     
     if (connect(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         close(server_sock);
@@ -408,7 +435,7 @@ void *prefetch_url(void *arg) {
         if (bytes <= 0) break;
         
         if (response_size + bytes > response_capacity) {
-            response_capacity = (response_capacity == 0) ? BUFFER_SIZE : response_capacity * 2;
+            response_capacity = (response_capacity == 0) ? BUFFER_SIZE : response_capacity + BUFFER_SIZE;
             char *new_data = realloc(response_data, response_capacity);
             if (!new_data) {
                 if (response_data) free(response_data);
@@ -588,7 +615,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    if (listen(server_socket, 50) < 0) {
+    if (listen(server_socket, 10) < 0) {
         perror("listen");
         close(server_socket);
         return 1;
