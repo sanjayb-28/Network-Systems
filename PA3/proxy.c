@@ -10,7 +10,6 @@
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <netdb.h>
-#include <arpa/inet.h>
 #include <time.h>
 #include <errno.h>
 
@@ -31,7 +30,6 @@ pthread_mutex_t prefetch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     int client_sock;
-    struct sockaddr_in client_addr;
 } client_info_t;
 
 void signal_handler(int sig) {
@@ -637,7 +635,6 @@ int main(int argc, char *argv[]) {
         
         client_info_t *client = malloc(sizeof(client_info_t));
         client->client_sock = client_sock;
-        client->client_addr = client_addr;
         
         pthread_t tid;
         pthread_create(&tid, NULL, handle_client, client);
