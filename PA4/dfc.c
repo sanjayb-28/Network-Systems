@@ -52,30 +52,25 @@ void read_config() {
 int get_hash_mod(const char *filename) {
     unsigned char digest[MD5_DIGEST_LENGTH];
     MD5((unsigned char*)filename, strlen(filename), digest);
-    // Use the first byte? Or sum? Assignment says "hash the filename and then apply a modulus"
-    // Usually standard is to treat hash as a number. 
-    // Let's use the whole hash or a portion. 
-    // Let's treat the first few bytes as an integer.
+    // Hash the filename using MD5
+    unsigned char digest[MD5_DIGEST_LENGTH];
+    MD5((unsigned char*)filename, strlen(filename), digest);
+    
+    // Use the first 4 bytes as an integer for the modulus operation
     unsigned int hash_val = 0;
-    // Let's just sum them up or use the first 4 bytes.
-    // A common way is to take the first 4 bytes as an integer.
     memcpy(&hash_val, digest, sizeof(unsigned int));
     return hash_val % 4;
 }
 
-// Table from assignment
+// Distribution table based on the assignment spec:
 // x    DFS1    DFS2    DFS3    DFS4
 // 0    (1,2)   (2,3)   (3,4)   (4,1)
 // 1    (4,1)   (1,2)   (2,3)   (3,4)
 // 2    (3,4)   (4,1)   (1,2)   (2,3)
 // 3    (2,3)   (3,4)   (4,1)   (1,2)
 
-// Map: table[x][server_idx] -> pairs to store
-// server_idx 0=DFS1, 1=DFS2, 2=DFS3, 3=DFS4
-// Pairs: 1=(P1,P2), 2=(P2,P3), 3=(P3,P4), 4=(P4,P1)
-// Wait, the table says:
-// DFS1 stores (1,2) means P1 and P2.
-// So let's map: table[x][server_idx] -> {chunk_a, chunk_b}
+// Map: table[x][server_idx] -> {chunk_1, chunk_2}
+// server_idx: 0=DFS1, 1=DFS2, 2=DFS3, 3=DFS4
 int distribution[4][4][2] = {
     {{1, 2}, {2, 3}, {3, 4}, {4, 1}}, // x=0
     {{4, 1}, {1, 2}, {2, 3}, {3, 4}}, // x=1
@@ -168,24 +163,11 @@ void put_file(const char *filepath_in) {
 
     int x = get_hash_mod(filename);
     
-    // We need to upload to all 4 servers if possible.
-    // The assignment says: "If there are not enough servers to store the file reliably, your program should respond with <filename> put failed."
-    // What is "reliably"?
-    // "The stored file now has (limited) redundancy - one failed server will not affect the integrity of the file."
-    // If we can store all pairs, we are good.
-    // If one server is down, we miss 2 pairs.
-    // Wait, if DFS1 is down (stores 1,2), we still have (4,1) on DFS2, (2,3) on DFS2... wait.
-    // x=0:
-    // DFS1: 1,2
-    // DFS2: 2,3
-    // DFS3: 3,4
-    // DFS4: 4,1
-    // If DFS1 down: we miss P1 copy 1, P2 copy 1.
-    // But DFS2 has P2 copy 2. DFS4 has P1 copy 2.
-    // So if 1 server is down, we still have all chunks.
-    // So "reliably" probably means at least 3 servers are up?
-    // Or maybe it just means "try to put to all, if fail too many, report error".
-    // Let's try to put to all available servers.
+    int x = get_hash_mod(filename);
+    
+    // Try to upload to all servers.
+    // We need at least 3 successful uploads to ensure we have enough redundancy.
+    // If 2 servers are down, we might lose a chunk completely (e.g., if DFS1 and DFS2 are down, we lose P2).
     
     int success_count = 0;
     for (int i = 0; i < num_servers; i++) {
@@ -197,14 +179,8 @@ void put_file(const char *filepath_in) {
         int c2_idx = distribution[x][i][1] - 1;
 
         // Send Chunk 1
-        // Protocol: PUT filename.partX
-        // Wait, we should probably store them as filename.1, filename.2 etc on the server?
-        // Or just store them with unique names?
-        // The assignment doesn't specify server storage format, but "Each DFS server should have its own directory".
-        // If we store "file.txt", we overwrite?
-        // We should store chunks. "splits the file into 4 equal length chunks P1, P2, P3, P4... uploads the pairs"
-        // So on DFS1 (x=0), we store P1 and P2.
-        // Let's name them filename.1, filename.2
+        // Format: .filename.chunkID
+        // We use a hidden file format to avoid cluttering the server directory
         
         // Helper to send one chunk
         char chunk_name[300];
@@ -248,9 +224,7 @@ void put_file(const char *filepath_in) {
 }
 
 void list_files() {
-    // Map: filename -> [chunk1_present, chunk2_present, chunk3_present, chunk4_present]
-    // But we need to handle many files.
-    // Let's just get the list from all servers and aggregate.
+    // Query all servers to build a comprehensive list of available files and their chunks.
     
     struct FileInfo {
         char name[256];
@@ -337,17 +311,10 @@ void get_file(const char *filename) {
     long chunk_lens[4] = {0, 0, 0, 0};
 
     for (int i = 0; i < num_servers; i++) {
-        // Optimization: if we have all chunks, stop? 
-        // No, we might need to try multiple servers if one fails?
-        // But we can stop if we have all 4.
+        // If we have all 4 chunks, we're done.
         if (chunks_found[0] && chunks_found[1] && chunks_found[2] && chunks_found[3]) break;
 
-        // Try to get chunks from this server
-        // We don't know which chunks this server has unless we calculate hash mod.
-        // But the server might have them even if it's not the primary owner? No, only owners store.
-        // But wait, if we are downloading, we should probably just ask for chunks we need.
-        // We can calculate where chunks SHOULD be.
-        
+        // Determine which chunks this server is supposed to have based on the hash
         int x = get_hash_mod(filename);
         // Server i should have:
         int c1 = distribution[x][i][0];

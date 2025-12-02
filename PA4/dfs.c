@@ -37,9 +37,8 @@ void *handle_client(void *args) {
     }
     buffer[n] = '\0';
 
-    // Simple parsing (expecting "COMMAND filename" or just "COMMAND")
-    // Note: This is a basic protocol. You might need a more robust one.
-    // For this assignment, let's assume the client sends "PUT filename size" or "GET filename" or "LIST"
+    // Basic protocol parsing: "COMMAND filename" or just "COMMAND"
+    // Supported: GET, PUT, LIST
     
     char *token = strtok(buffer, " \n");
     if (token == NULL) {
@@ -65,10 +64,8 @@ void *handle_client(void *args) {
                 long filesize = ftell(f);
                 fseek(f, 0, SEEK_SET);
                 
-                // Send file size? Or just stream? 
-                // Let's send size first for robustness if client expects it, 
-                // but if client just reads until close, that's fine too.
-                // Let's stick to a simple protocol: OK\n<content>
+                // Protocol: OK\n<content>
+                // We send the file content directly. The client reads until the connection closes or based on its own logic.
                 
                 char file_buf[BUFFER_SIZE];
                 size_t bytes_read;
@@ -87,27 +84,11 @@ void *handle_client(void *args) {
             char filepath[512];
             snprintf(filepath, sizeof(filepath), "%s/%s", dir, filename);
             
-            // Expecting size next? Or just read until close?
-            // Usually PUT sends size. Let's assume the rest of the buffer (if any) is data
-            // and we keep reading.
-            // But wait, if we use a single connection for multiple requests, we need framing.
-            // The assignment implies simple one-off or keep-alive. 
-            // "Your DFS servers must handle multiple connections and service multiple DFCs concurrently"
-            
-            // Let's look at how we want to implement the client. 
-            // Client: connect, send "PUT filename", send data, close.
-            // Server: read "PUT filename", open file, write data until EOF.
-            
-            // But wait, the first read might contain part of the file data if it was sent quickly.
-            // The strtok corrupted the buffer. We need to be careful.
-            
-            // Better protocol:
-            // Client sends: "PUT filename\n"
-            // Server sends: "READY\n"
-            // Client sends: data...
-            // Server closes or sends "OK\n"
-            
-            // Let's try to implement a slightly more robust handshake.
+            // Handshake:
+            // Client: PUT filename
+            // Server: READY
+            // Client: <data>
+            // Server: <closes connection>
             write(sock, "READY\n", 6);
             
             FILE *f = fopen(filepath, "wb");
