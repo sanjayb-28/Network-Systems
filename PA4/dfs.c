@@ -37,8 +37,7 @@ void *handle_client(void *args) {
     }
     buffer[n] = '\0';
 
-    // Basic protocol parsing: "COMMAND filename" or just "COMMAND"
-    // Supported: GET, PUT, LIST
+    // Parse command (GET, PUT, LIST)
     
     char *token = strtok(buffer, " \n");
     if (token == NULL) {
@@ -64,8 +63,7 @@ void *handle_client(void *args) {
                 long filesize = ftell(f);
                 fseek(f, 0, SEEK_SET);
                 
-                // Protocol: OK\n<content>
-                // We send the file content directly. The client reads until the connection closes or based on its own logic.
+                // Send OK and file content
                 
                 char file_buf[BUFFER_SIZE];
                 size_t bytes_read;
@@ -84,11 +82,7 @@ void *handle_client(void *args) {
             char filepath[512];
             snprintf(filepath, sizeof(filepath), "%s/%s", dir, filename);
             
-            // Handshake:
-            // Client: PUT filename
-            // Server: READY
-            // Client: <data>
-            // Server: <closes connection>
+            // Send READY to accept data
             write(sock, "READY\n", 6);
             
             FILE *f = fopen(filepath, "wb");

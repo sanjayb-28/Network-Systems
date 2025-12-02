@@ -6,7 +6,6 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
-#include <openssl/md5.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <libgen.h>
@@ -50,11 +49,28 @@ void read_config() {
 }
 
 int get_hash_mod(const char *filename) {
-    unsigned char digest[MD5_DIGEST_LENGTH];
-    MD5((unsigned char*)filename, strlen(filename), digest);
-    // Hash the filename using MD5
-    unsigned char digest[MD5_DIGEST_LENGTH];
-    MD5((unsigned char*)filename, strlen(filename), digest);
+    char command[512];
+    snprintf(command, sizeof(command), "printf '%%s' '%s' | md5sum", filename);
+    
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        perror("Failed to run md5sum");
+        return 0;
+    }
+
+    char digest_str[33];
+    if (fgets(digest_str, sizeof(digest_str), fp) == NULL) {
+        pclose(fp);
+        return 0;
+    }
+    pclose(fp);
+
+    unsigned char digest[16];
+    for (int i = 0; i < 16; i++) {
+        unsigned int val;
+        sscanf(&digest_str[i*2], "%02x", &val);
+        digest[i] = (unsigned char)val;
+    }
     
     // Use the first 4 bytes as an integer for the modulus operation
     unsigned int hash_val = 0;
@@ -62,15 +78,7 @@ int get_hash_mod(const char *filename) {
     return hash_val % 4;
 }
 
-// Distribution table based on the assignment spec:
-// x    DFS1    DFS2    DFS3    DFS4
-// 0    (1,2)   (2,3)   (3,4)   (4,1)
-// 1    (4,1)   (1,2)   (2,3)   (3,4)
-// 2    (3,4)   (4,1)   (1,2)   (2,3)
-// 3    (2,3)   (3,4)   (4,1)   (1,2)
-
-// Map: table[x][server_idx] -> {chunk_1, chunk_2}
-// server_idx: 0=DFS1, 1=DFS2, 2=DFS3, 3=DFS4
+// Distribution table: table[hash_mod][server_idx] -> {chunk_1, chunk_2}
 int distribution[4][4][2] = {
     {{1, 2}, {2, 3}, {3, 4}, {4, 1}}, // x=0
     {{4, 1}, {1, 2}, {2, 3}, {3, 4}}, // x=1
@@ -163,11 +171,8 @@ void put_file(const char *filepath_in) {
 
     int x = get_hash_mod(filename);
     
-    int x = get_hash_mod(filename);
     
-    // Try to upload to all servers.
-    // We need at least 3 successful uploads to ensure we have enough redundancy.
-    // If 2 servers are down, we might lose a chunk completely (e.g., if DFS1 and DFS2 are down, we lose P2).
+    // Upload chunks to all available servers
     
     int success_count = 0;
     for (int i = 0; i < num_servers; i++) {
@@ -179,8 +184,6 @@ void put_file(const char *filepath_in) {
         int c2_idx = distribution[x][i][1] - 1;
 
         // Send Chunk 1
-        // Format: .filename.chunkID
-        // We use a hidden file format to avoid cluttering the server directory
         
         // Helper to send one chunk
         char chunk_name[300];
@@ -224,7 +227,7 @@ void put_file(const char *filepath_in) {
 }
 
 void list_files() {
-    // Query all servers to build a comprehensive list of available files and their chunks.
+    // Query all servers for file lists
     
     struct FileInfo {
         char name[256];
